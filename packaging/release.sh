@@ -20,7 +20,7 @@ cd "$(dirname "$0")/.."
 ROOT="$(pwd)"
 
 # --- konfiguracja (nadpisywalna przez env) ---
-SRC_REPO="${PARLEY_SRC_REPO:-zbyhoo/parley-tui}"
+SRC_REPO="${PARLEY_SRC_REPO:-zbyhoo/parley}"
 TAP_REPO="${PARLEY_TAP_REPO:-zbyhoo/homebrew-parley}"
 TUPLE="aarch64-apple-darwin"
 

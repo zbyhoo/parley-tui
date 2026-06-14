@@ -1,0 +1,6 @@
+.superpowers/
+.parley/
+target/
+dist/
+.DS_Store
+docs/

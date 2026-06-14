@@ -1,28 +1,28 @@
-# parley
+# 🗣️ parley
 
 Terminalowy interfejs (TUI) do równoległej pracy z wieloma agentami AI
-(`claude`, `codex`) obok siebie, w jednym oknie. Agenci mogą komunikować się
+(`claude`, `codex`) obok siebie, w jednym oknie. 🤝 Agenci mogą komunikować się
 między sobą (broker MCP).
 
-## Wymagania
+## 📋 Wymagania
 
 - macOS na Apple Silicon (arm64)
 - CLI agentów dostępne w `PATH`:
   - `claude` — [instalacja](https://docs.claude.com/claude-code)
   - `codex`
 
-## Instalacja (użytkownik)
+## 📦 Instalacja (użytkownik)
 
 ```bash
 brew install zbyhoo/parley/parley
 ```
 
-Po instalacji `parley` jest dostępne w terminalu z dowolnego katalogu.
+Po instalacji `parley` jest dostępne w terminalu z dowolnego katalogu. 🎉
 
-- Aktualizacja: `brew upgrade parley`
-- Odinstalowanie: `brew uninstall parley && brew untap zbyhoo/parley`
+- ⬆️ Aktualizacja: `brew upgrade parley`
+- 🗑️ Odinstalowanie: `brew uninstall parley && brew untap zbyhoo/parley`
 
-## Użycie
+## ⌨️ Użycie
 
 Uruchom w katalogu projektu:
 
@@ -43,12 +43,12 @@ Skróty klawiszowe:
 
 Stan sesji trafia do `.parley/` w katalogu projektu.
 
-## Konfiguracja
+## ⚙️ Konfiguracja
 
 Opcjonalny plik konfiguracyjny pozwala nadpisać komendy agentów
 (`command`, `resume_command`). Domyślnie: `claude` i `codex`.
 
-## Budowanie ze źródła (dev)
+## 🔨 Budowanie ze źródła (dev)
 
 ```bash
 ./build.sh            # release binarka -> dist/parley
@@ -57,7 +57,7 @@ Opcjonalny plik konfiguracyjny pozwala nadpisać komendy agentów
 `cargo` nie musi być w `PATH` — skrypt sam dołącza toolchain rustup
 (`~/.rustup/toolchains/stable-aarch64-apple-darwin/bin`).
 
-## Wydanie nowej wersji
+## 🚀 Wydanie nowej wersji
 
 1. Podbij `version` w `Cargo.toml`.
 2. Uruchom:

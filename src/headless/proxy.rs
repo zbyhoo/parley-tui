@@ -31,11 +31,12 @@ impl ProxyHandle {
     }
 }
 
-/// Owned half: holds the child process, master PTY, and original termios.
+/// Owned half: holds the child process, master PTY (shared via Arc), and original termios.
 /// Call `wait(self)` on the main thread to wait for child exit.
 pub struct ProxyChild {
     child: Box<dyn Child + Send + Sync>,
-    master: Box<dyn MasterPty + Send>,
+    /// Shared with the SIGWINCH thread so it can resize the PTY on terminal resize.
+    master: Arc<Mutex<Box<dyn MasterPty + Send>>>,
     orig_termios: Option<libc::termios>,
 }
 
@@ -46,13 +47,18 @@ impl ProxyChild {
         if let Some(orig) = self.orig_termios.take() {
             restore_raw(&orig);
         }
+        // master Arc is dropped here; SIGWINCH thread holds its own Arc clone
+        // and will fail gracefully on lock once the process exits anyway.
         code
     }
 
     /// Resize the PTY to match the current terminal size.
+    /// resize_to_current remains available for callers; SIGWINCH now drives resizing automatically.
     pub fn resize_to_current(&self) {
         let (rows, cols) = term_size();
-        let _ = self.master.resize(PtySize { rows, cols, pixel_width: 0, pixel_height: 0 });
+        if let Ok(m) = self.master.lock() {
+            let _ = m.resize(PtySize { rows, cols, pixel_width: 0, pixel_height: 0 });
+        }
     }
 }
 
@@ -73,10 +79,29 @@ impl Proxy {
         let child = pair.slave.spawn_command(cmd).map_err(|e| anyhow::anyhow!("spawn: {e}"))?;
         drop(pair.slave);
 
-        let mut reader =
-            pair.master.try_clone_reader().map_err(|e| anyhow::anyhow!("reader: {e}"))?;
-        let writer: Box<dyn Write + Send> =
-            pair.master.take_writer().map_err(|e| anyhow::anyhow!("writer: {e}"))?;
+        // Block SIGWINCH on the main thread before spawning threads so all
+        // child threads inherit the mask. The dedicated SIGWINCH thread will
+        // sigwait() for it and call resize on delivery.
+        #[cfg(unix)]
+        unsafe {
+            let mut set: libc::sigset_t = std::mem::zeroed();
+            libc::sigemptyset(&mut set);
+            libc::sigaddset(&mut set, libc::SIGWINCH);
+            libc::pthread_sigmask(libc::SIG_BLOCK, &set, std::ptr::null_mut());
+        }
+
+        // Wrap master in Arc<Mutex<...>> so the SIGWINCH thread can resize it.
+        let master_arc: Arc<Mutex<Box<dyn MasterPty + Send>>> =
+            Arc::new(Mutex::new(pair.master));
+
+        let mut reader = {
+            let m = master_arc.lock().unwrap();
+            m.try_clone_reader().map_err(|e| anyhow::anyhow!("reader: {e}"))?
+        };
+        let writer: Box<dyn Write + Send> = {
+            let m = master_arc.lock().unwrap();
+            m.take_writer().map_err(|e| anyhow::anyhow!("writer: {e}"))?
+        };
         let writer = Arc::new(Mutex::new(writer));
 
         // master → stdout
@@ -120,8 +145,39 @@ impl Proxy {
             });
         }
 
+        // SIGWINCH thread: sigwait for SIGWINCH and resize PTY to match new terminal size.
+        // Runs forever; torn down on process exit. resize_to_current() remains callable manually.
+        {
+            let master_arc = Arc::clone(&master_arc);
+            std::thread::spawn(move || {
+                #[cfg(unix)]
+                unsafe {
+                    let mut set: libc::sigset_t = std::mem::zeroed();
+                    libc::sigemptyset(&mut set);
+                    libc::sigaddset(&mut set, libc::SIGWINCH);
+                    // Re-block in this thread's mask (inherited, but explicit for clarity).
+                    libc::pthread_sigmask(libc::SIG_BLOCK, &set, std::ptr::null_mut());
+                    let mut sig: libc::c_int = 0;
+                    loop {
+                        if libc::sigwait(&set, &mut sig) != 0 {
+                            break;
+                        }
+                        let (rows, cols) = term_size();
+                        if let Ok(m) = master_arc.lock() {
+                            let _ = m.resize(PtySize {
+                                rows,
+                                cols,
+                                pixel_width: 0,
+                                pixel_height: 0,
+                            });
+                        }
+                    }
+                }
+            });
+        }
+
         let handle = ProxyHandle { writer };
-        let child_part = ProxyChild { child, master: pair.master, orig_termios };
+        let child_part = ProxyChild { child, master: master_arc, orig_termios };
         Ok((handle, child_part))
     }
 }

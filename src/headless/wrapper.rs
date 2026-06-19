@@ -4,7 +4,7 @@ use std::sync::atomic::{AtomicBool, Ordering};
 use std::sync::Arc;
 use std::time::Duration;
 
-use anyhow::Result;
+use anyhow::{Context, Result};
 
 use crate::headless::discovery::{ensure_broker, BrokerInfo};
 use crate::headless::proxy::{Proxy, ProxyHandle};
@@ -15,7 +15,7 @@ pub fn run(as_id: Option<String>, command: Vec<String>) -> Result<()> {
     let self_exe = std::env::current_exe()?;
     let info = ensure_broker(&state_dir, &cwd, &self_exe)?;
 
-    let binary = command[0].clone();
+    let binary = command.first().context("empty command")?.clone();
     let id = register(&info, &binary, as_id.as_deref())?;
     eprintln!("[parley] connected as '{id}' (broker port {})", info.port);
 
@@ -34,7 +34,7 @@ pub fn run(as_id: Option<String>, command: Vec<String>) -> Result<()> {
 
     // Long-poll thread gets a clone of the handle (no shared ownership of child).
     let stop = Arc::new(AtomicBool::new(false));
-    let poll_handle = {
+    let _poll_handle = {
         let info = info.clone();
         let id = id.clone();
         let poll_handle_clone = handle.clone();
@@ -45,8 +45,10 @@ pub fn run(as_id: Option<String>, command: Vec<String>) -> Result<()> {
     // Main thread owns the child; blocks here until agent exits.
     let code = proxy_child.wait();
 
+    // Set stop flag so the poll thread exits its loop, then deregister.
+    // We do NOT join the poll thread: it may be mid-long-poll (up to 30 s).
+    // process::exit tears down the abandoned thread immediately, so we exit promptly.
     stop.store(true, Ordering::SeqCst);
-    let _ = poll_handle.join();
     let _ = deregister(&info, &id);
     std::process::exit(code);
 }

@@ -251,16 +251,8 @@ async fn register(
     let mut reg = state.reg.lock().unwrap();
     match reg.register(&req.binary, req.r#as.as_deref()) {
         Ok((id, rx)) => {
-            let peers: Vec<String> = reg
-                .list()
-                .into_iter()
-                .map(|(pid, _)| pid)
-                .filter(|p| p != &id)
-                .collect();
-            let announce = format!(
-                "[parley: peer \"{id}\" connected — reach it with send_to_peer(to=\"{id}\")]"
-            );
-            reg.send_system_to_all(&announce, &id);
+            // Discovery is pull-only via list_peers: no join announcement is pushed,
+            // so a connecting peer never injects a spurious turn into working agents.
             drop(reg);
             state
                 .receivers
@@ -268,7 +260,7 @@ async fn register(
                 .unwrap()
                 .insert(id.clone(), Arc::new(tokio::sync::Mutex::new(rx)));
             state.ever_registered.store(true, std::sync::atomic::Ordering::SeqCst);
-            Json(serde_json::json!({ "id": id, "peers": peers }))
+            Json(serde_json::json!({ "id": id }))
         }
         Err(crate::headless::peer::RegisterError::Collision(c)) => {
             Json(serde_json::json!({ "error": "collision", "id": c }))

@@ -16,7 +16,7 @@ pub fn run(as_id: Option<String>, command: Vec<String>) -> Result<()> {
     let info = ensure_broker(&state_dir, &cwd, &self_exe)?;
 
     let binary = command.first().context("empty command")?.clone();
-    let (id, peers) = register(&info, &binary, as_id.as_deref())?;
+    let id = register(&info, &binary, as_id.as_deref())?;
     eprintln!("[parley] connected as '{id}' (broker port {})", info.port);
 
     // MCP args injection
@@ -31,13 +31,6 @@ pub fn run(as_id: Option<String>, command: Vec<String>) -> Result<()> {
     full.extend(extra);
 
     let (handle, proxy_child) = Proxy::spawn(&full, &cwd)?;
-
-    if !peers.is_empty() {
-        let list = peers.join(", ");
-        handle.inject(&format!(
-            "[parley: connected peers: {list} — to reach one, call send_to_peer with its id as \"to\"]"
-        ));
-    }
 
     // Long-poll thread gets a clone of the handle (no shared ownership of child).
     let stop = Arc::new(AtomicBool::new(false));
@@ -60,7 +53,7 @@ pub fn run(as_id: Option<String>, command: Vec<String>) -> Result<()> {
     std::process::exit(code);
 }
 
-fn register(info: &BrokerInfo, binary: &str, as_id: Option<&str>) -> Result<(String, Vec<String>)> {
+fn register(info: &BrokerInfo, binary: &str, as_id: Option<&str>) -> Result<String> {
     let url = format!("http://127.0.0.1:{}/register?token={}", info.port, info.token);
     let body = serde_json::json!({ "binary": binary, "as": as_id });
     let resp: serde_json::Value = reqwest::blocking::Client::new()
@@ -69,12 +62,7 @@ fn register(info: &BrokerInfo, binary: &str, as_id: Option<&str>) -> Result<(Str
         anyhow::bail!("id '{}' already in use", as_id.unwrap_or(binary));
     }
     if let Some(id) = resp.get("id").and_then(|v| v.as_str()) {
-        let peers = resp
-            .get("peers")
-            .and_then(|p| p.as_array())
-            .map(|a| a.iter().filter_map(|v| v.as_str().map(String::from)).collect::<Vec<_>>())
-            .unwrap_or_default();
-        return Ok((id.to_string(), peers));
+        return Ok(id.to_string());
     }
     anyhow::bail!("register failed: {resp}")
 }

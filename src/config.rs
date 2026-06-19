@@ -167,6 +167,62 @@ pub fn write_claude_mcp_config(path: &Path, port: u16) -> std::io::Result<()> {
     std::fs::write(path, json)
 }
 
+/// Argi codex dla dowolnego id + token (uogólnienie `mcp_extra_args` z Etapu MCP).
+pub fn mcp_args_codex(id: &str, port: u16, token: &str) -> Vec<String> {
+    vec![
+        "-c".into(),
+        format!("mcp_servers.parley.url=\"http://127.0.0.1:{port}/mcp\""),
+        "-c".into(),
+        format!(
+            "mcp_servers.parley.http_headers={{ \"X-Agent-Id\" = \"{id}\", \"X-Parley-Token\" = \"{token}\" }}"
+        ),
+        "-c".into(),
+        "mcp_servers.parley.tools.send_to_peer.approval_mode=\"auto\"".into(),
+    ]
+}
+
+/// Flagi claude wskazujące plik konfiguracji MCP + allowlista narzędzi peerowych.
+pub fn mcp_args_claude(_id: &str, config_path: &Path) -> Vec<String> {
+    vec![
+        "--mcp-config".into(),
+        config_path.to_string_lossy().into_owned(),
+        "--allowedTools".into(),
+        "mcp__parley__send_to_peer,mcp__parley__list_peers".into(),
+    ]
+}
+
+/// Plik JSON konfiguracji MCP dla claude (dowolne id + token).
+pub fn write_mcp_config_json(
+    path: &Path,
+    id: &str,
+    port: u16,
+    token: &str,
+) -> std::io::Result<()> {
+    if let Some(parent) = path.parent() {
+        std::fs::create_dir_all(parent)?;
+    }
+    let json = format!(
+        "{{\n  \"mcpServers\": {{\n    \"parley\": {{\n      \"type\": \"http\",\n      \"url\": \"http://127.0.0.1:{port}/mcp\",\n      \"headers\": {{ \"X-Agent-Id\": \"{id}\", \"X-Parley-Token\": \"{token}\" }}\n    }}\n  }}\n}}\n"
+    );
+    std::fs::write(path, json)
+}
+
+/// Dispatch po nazwie binarki: `codex*` → inline `-c`, reszta → flagi claude.
+pub fn mcp_args_for(
+    binary: &str,
+    id: &str,
+    port: u16,
+    token: &str,
+    claude_config_path: &Path,
+) -> Vec<String> {
+    let base = Path::new(binary).file_name().and_then(|s| s.to_str()).unwrap_or(binary);
+    if base.starts_with("codex") {
+        mcp_args_codex(id, port, token)
+    } else {
+        mcp_args_claude(id, claude_config_path)
+    }
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
@@ -327,5 +383,32 @@ resume_command = ["codex", "resume", "--last"]
         let cfg = Config::load(dir.path()).unwrap();
         assert_eq!(cfg.codex.command, "my-custom-agent");
         assert_eq!(cfg.codex.resume_command, None); // nie dziedziczy `codex resume --last`
+    }
+
+    #[test]
+    fn codex_args_carry_id_and_token() {
+        let args = mcp_args_codex("claude-2", 8765, "tok123");
+        assert!(args.iter().any(|a| a.contains("mcp_servers.parley.url=\"http://127.0.0.1:8765/mcp\"")));
+        assert!(args.iter().any(|a| a.contains("X-Agent-Id") && a.contains("claude-2")));
+        assert!(args.iter().any(|a| a.contains("X-Parley-Token") && a.contains("tok123")));
+        assert!(args.iter().any(|a| a.contains("approval_mode") && a.contains("auto")));
+    }
+
+    #[test]
+    fn claude_config_json_has_id_and_token() {
+        let dir = tempfile::tempdir().unwrap();
+        let path = dir.path().join(".parley/mcp-reviewer.json");
+        write_mcp_config_json(&path, "reviewer", 8765, "tok123").unwrap();
+        let c = std::fs::read_to_string(&path).unwrap();
+        assert!(c.contains("http://127.0.0.1:8765/mcp"));
+        assert!(c.contains("\"X-Agent-Id\": \"reviewer\""));
+        assert!(c.contains("\"X-Parley-Token\": \"tok123\""));
+    }
+
+    #[test]
+    fn args_for_dispatches_by_binary() {
+        let p = Path::new("/tmp/c.json");
+        assert!(mcp_args_for("codex", "codex", 1, "t", p).contains(&"-c".to_string()));
+        assert!(mcp_args_for("claude", "claude", 1, "t", p).contains(&"--mcp-config".to_string()));
     }
 }

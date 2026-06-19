@@ -20,6 +20,7 @@ pub struct HubState {
     pub timeline: Mutex<Timeline>,
     pub pollers: Mutex<HashSet<String>>,
     pub receivers: Mutex<HashMap<String, Arc<tokio::sync::Mutex<tokio::sync::mpsc::Receiver<crate::headless::peer::IncomingMsg>>>>>,
+    pub ever_registered: std::sync::atomic::AtomicBool,
 }
 
 /// Buduje tekst zwracany agentowi po `send_to_peer`.
@@ -169,7 +170,11 @@ impl ServerHandler for HubBroker {
 // ─── axum control endpoints + serve() ────────────────────────────────────────
 
 use std::path::PathBuf;
-use std::time::Duration;
+use std::time::{Duration, Instant};
+
+const PEER_TTL: Duration = Duration::from_secs(60);
+const REAP_INTERVAL: Duration = Duration::from_secs(15);
+const EMPTY_SHUTDOWN_AFTER: Duration = Duration::from_secs(45);
 
 use axum::extract::{Path as AxPath, Query, State};
 use axum::routing::{get, post};
@@ -231,17 +236,41 @@ async fn register(
     if !ok_token(&state, &q.token) {
         return Json(serde_json::json!({ "error": "invalid token" }));
     }
+    let now = Instant::now();
+    // 1) reap stale peers first, clean their receivers/pollers
+    let reaped = { state.reg.lock().unwrap().reap(now, PEER_TTL) };
+    if !reaped.is_empty() {
+        let mut recv = state.receivers.lock().unwrap();
+        let mut poll = state.pollers.lock().unwrap();
+        for id in &reaped {
+            recv.remove(id);
+            poll.remove(id);
+        }
+    }
+    // 2) register the joiner
     let mut reg = state.reg.lock().unwrap();
     match reg.register(&req.binary, req.r#as.as_deref()) {
         Ok((id, rx)) => {
+            let peers: Vec<String> = reg
+                .list()
+                .into_iter()
+                .map(|(pid, _)| pid)
+                .filter(|p| p != &id)
+                .collect();
+            let announce = format!(
+                "[parley: peer \"{id}\" connected — reach it with send_to_peer(to=\"{id}\")]"
+            );
+            reg.send_system_to_all(&announce, &id);
+            drop(reg);
             state
                 .receivers
                 .lock()
                 .unwrap()
                 .insert(id.clone(), Arc::new(tokio::sync::Mutex::new(rx)));
-            Json(serde_json::json!({ "id": id }))
+            state.ever_registered.store(true, std::sync::atomic::Ordering::SeqCst);
+            Json(serde_json::json!({ "id": id, "peers": peers }))
         }
-        Err(RegisterError::Collision(c)) => {
+        Err(crate::headless::peer::RegisterError::Collision(c)) => {
             Json(serde_json::json!({ "error": "collision", "id": c }))
         }
     }
@@ -255,6 +284,7 @@ async fn poll(
     if !ok_token(&state, &q.token) {
         return Json(PollResp { message: None });
     }
+    state.reg.lock().unwrap().touch(&id, Instant::now());
     let rx = state.receivers.lock().unwrap().get(&id).cloned();
     let Some(rx) = rx else {
         return Json(PollResp { message: None });
@@ -282,6 +312,39 @@ async fn deregister(
     Json(serde_json::json!({ "ok": true }))
 }
 
+fn spawn_reaper(state: Arc<HubState>, broker_json: std::path::PathBuf) {
+    tokio::spawn(async move {
+        let mut empty_since: Option<Instant> = None;
+        loop {
+            tokio::time::sleep(REAP_INTERVAL).await;
+            let now = Instant::now();
+            let reaped = { state.reg.lock().unwrap().reap(now, PEER_TTL) };
+            if !reaped.is_empty() {
+                let mut recv = state.receivers.lock().unwrap();
+                let mut poll = state.pollers.lock().unwrap();
+                for id in &reaped {
+                    recv.remove(id);
+                    poll.remove(id);
+                }
+            }
+            let empty = { state.reg.lock().unwrap().list().is_empty() };
+            let ever = state.ever_registered.load(std::sync::atomic::Ordering::SeqCst);
+            if empty && ever {
+                match empty_since {
+                    None => empty_since = Some(now),
+                    Some(t) if now.duration_since(t) >= EMPTY_SHUTDOWN_AFTER => {
+                        let _ = std::fs::remove_file(&broker_json);
+                        std::process::exit(0);
+                    }
+                    _ => {}
+                }
+            } else {
+                empty_since = None;
+            }
+        }
+    });
+}
+
 /// Bind 127.0.0.1:0, build HubState (token, session timeline), write broker.json, serve forever.
 /// Foreground; called by `parley __serve`.
 pub fn serve(cwd: PathBuf) -> anyhow::Result<()> {
@@ -304,6 +367,7 @@ pub fn serve(cwd: PathBuf) -> anyhow::Result<()> {
         timeline: Mutex::new(timeline),
         pollers: Mutex::new(HashSet::new()),
         receivers: Mutex::new(HashMap::new()),
+        ever_registered: std::sync::atomic::AtomicBool::new(false),
     });
 
     write_atomic(
@@ -316,6 +380,7 @@ pub fn serve(cwd: PathBuf) -> anyhow::Result<()> {
         },
     )?;
 
+    let state_dir2 = state_dir.clone();
     let rt = tokio::runtime::Builder::new_current_thread().enable_all().build()?;
     rt.block_on(async move {
         let listener = tokio::net::TcpListener::from_std(std_listener)?;
@@ -332,6 +397,7 @@ pub fn serve(cwd: PathBuf) -> anyhow::Result<()> {
             .route("/poll/{id}", get(poll))
             .route("/deregister", post(deregister))
             .with_state(state.clone());
+        spawn_reaper(state.clone(), crate::headless::discovery::broker_json_path(&state_dir2));
         axum::serve(listener, app).await?;
         Ok::<(), anyhow::Error>(())
     })

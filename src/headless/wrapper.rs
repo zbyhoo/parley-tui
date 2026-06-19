@@ -16,7 +16,7 @@ pub fn run(as_id: Option<String>, command: Vec<String>) -> Result<()> {
     let info = ensure_broker(&state_dir, &cwd, &self_exe)?;
 
     let binary = command.first().context("empty command")?.clone();
-    let id = register(&info, &binary, as_id.as_deref())?;
+    let (id, peers) = register(&info, &binary, as_id.as_deref())?;
     eprintln!("[parley] connected as '{id}' (broker port {})", info.port);
 
     // MCP args injection
@@ -31,6 +31,13 @@ pub fn run(as_id: Option<String>, command: Vec<String>) -> Result<()> {
     full.extend(extra);
 
     let (handle, proxy_child) = Proxy::spawn(&full, &cwd)?;
+
+    if !peers.is_empty() {
+        let list = peers.join(", ");
+        handle.inject(&format!(
+            "[parley: connected peers: {list} — reach them with send_to_peer(to=\"<id>\")]"
+        ));
+    }
 
     // Long-poll thread gets a clone of the handle (no shared ownership of child).
     let stop = Arc::new(AtomicBool::new(false));
@@ -53,21 +60,23 @@ pub fn run(as_id: Option<String>, command: Vec<String>) -> Result<()> {
     std::process::exit(code);
 }
 
-fn register(info: &BrokerInfo, binary: &str, as_id: Option<&str>) -> Result<String> {
+fn register(info: &BrokerInfo, binary: &str, as_id: Option<&str>) -> Result<(String, Vec<String>)> {
     let url = format!("http://127.0.0.1:{}/register?token={}", info.port, info.token);
     let body = serde_json::json!({ "binary": binary, "as": as_id });
-    let resp: serde_json::Value =
-        reqwest::blocking::Client::new().post(&url).json(&body).send()?.json()?;
-    if let Some(err) = resp.get("error").and_then(|v| v.as_str()) {
-        if err == "collision" {
-            anyhow::bail!("id '{}' already in use", as_id.unwrap_or(binary));
-        }
-        anyhow::bail!("register failed: {resp}");
+    let resp: serde_json::Value = reqwest::blocking::Client::new()
+        .post(&url).json(&body).send()?.json()?;
+    if resp.get("error").and_then(|v| v.as_str()) == Some("collision") {
+        anyhow::bail!("id '{}' already in use", as_id.unwrap_or(binary));
     }
     if let Some(id) = resp.get("id").and_then(|v| v.as_str()) {
-        return Ok(id.to_string());
+        let peers = resp
+            .get("peers")
+            .and_then(|p| p.as_array())
+            .map(|a| a.iter().filter_map(|v| v.as_str().map(String::from)).collect::<Vec<_>>())
+            .unwrap_or_default();
+        return Ok((id.to_string(), peers));
     }
-    anyhow::bail!("register failed (no id): {resp}")
+    anyhow::bail!("register failed: {resp}")
 }
 
 fn deregister(info: &BrokerInfo, id: &str) -> Result<()> {
@@ -91,9 +100,15 @@ fn poll_loop(info: &BrokerInfo, id: &str, handle: &ProxyHandle, stop: &AtomicBoo
                 if let Some(msg) = v.get("message").filter(|m| !m.is_null()) {
                     let from = msg.get("from").and_then(|s| s.as_str()).unwrap_or("peer");
                     let text = msg.get("text").and_then(|s| s.as_str()).unwrap_or("");
-                    handle.inject(&format!(
-                        "[incoming message from {from} — to reply, call the send_to_peer tool with to=\"{from}\"]: {text}"
-                    ));
+                    let kind = msg.get("kind").and_then(|s| s.as_str()).unwrap_or("peer");
+                    let injected = if kind == "system" {
+                        text.to_string()
+                    } else {
+                        format!(
+                            "[incoming message from {from} — to reply, call the send_to_peer tool with to=\"{from}\"]: {text}"
+                        )
+                    };
+                    handle.inject(&injected);
                 }
             }
             Err(_) => std::thread::sleep(Duration::from_millis(500)),

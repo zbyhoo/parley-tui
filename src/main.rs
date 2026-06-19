@@ -33,6 +33,12 @@ fn disable_keyboard_enhancement() {
 }
 
 fn main() -> Result<()> {
+    let args: Vec<String> = std::env::args().skip(1).collect();
+    match parley_tui::headless::dispatch(args)? {
+        parley_tui::headless::Dispatch::Done => return Ok(()),
+        parley_tui::headless::Dispatch::RunTui => {} // spada do istniejącego kodu TUI
+    }
+
     let cwd = std::env::current_dir()?;
     let config = Config::load(&cwd)?;
     let hygiene_warning = parley_tui::hygiene::ensure_gitignore(&cwd)

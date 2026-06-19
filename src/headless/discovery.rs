@@ -153,6 +153,21 @@ pub fn ensure_broker(
     anyhow::bail!("broker did not come up within 5s (see .parley/broker.log)")
 }
 
+pub fn stop_broker(state_dir: &Path) -> anyhow::Result<()> {
+    let bj = broker_json_path(state_dir);
+    let Some(info) = read(&bj) else {
+        println!("no broker running");
+        return Ok(());
+    };
+    #[cfg(unix)]
+    unsafe {
+        libc::kill(info.pid as i32, libc::SIGTERM);
+    }
+    let _ = std::fs::remove_file(&bj);
+    println!("stopped broker (pid {})", info.pid);
+    Ok(())
+}
+
 struct LockGuard(PathBuf);
 impl Drop for LockGuard {
     fn drop(&mut self) {

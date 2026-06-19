@@ -2,6 +2,8 @@ pub mod cli;
 pub mod discovery;
 pub mod hub;
 pub mod peer;
+pub mod proxy;
+pub mod wrapper;
 
 use anyhow::Result;
 use cli::Invocation;
@@ -28,6 +30,9 @@ pub fn dispatch(args: Vec<String>) -> Result<Dispatch> {
             Ok(Dispatch::Done)
         }
         Invocation::Mcp => anyhow::bail!("`parley mcp` not yet implemented"),
-        Invocation::Wrapper { .. } => anyhow::bail!("wrapper not yet implemented"),
+        Invocation::Wrapper { as_id, command } => {
+            wrapper::run(as_id, command)?;
+            Ok(Dispatch::Done)
+        }
     }
 }

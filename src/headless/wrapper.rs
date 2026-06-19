@@ -1,0 +1,98 @@
+//! Orkiestracja wrappera headless: register → spawn PTY proxy → long-poll → deregister.
+use std::path::Path;
+use std::sync::atomic::{AtomicBool, Ordering};
+use std::sync::Arc;
+use std::time::Duration;
+
+use anyhow::Result;
+
+use crate::headless::discovery::{ensure_broker, BrokerInfo};
+use crate::headless::proxy::{Proxy, ProxyHandle};
+
+pub fn run(as_id: Option<String>, command: Vec<String>) -> Result<()> {
+    let cwd = std::env::current_dir()?;
+    let state_dir = cwd.join(".parley");
+    let self_exe = std::env::current_exe()?;
+    let info = ensure_broker(&state_dir, &cwd, &self_exe)?;
+
+    let binary = command[0].clone();
+    let id = register(&info, &binary, as_id.as_deref())?;
+    eprintln!("[parley] connected as '{id}' (broker port {})", info.port);
+
+    // MCP args injection
+    let cfg_path = state_dir.join(format!("mcp-{id}.json"));
+    let base = Path::new(&binary).file_name().and_then(|s| s.to_str()).unwrap_or(&binary);
+    if !base.starts_with("codex") {
+        crate::config::write_mcp_config_json(&cfg_path, &id, info.port, &info.token)
+            .map_err(|e| anyhow::anyhow!("write_mcp_config_json: {e}"))?;
+    }
+    let mut full = command.clone();
+    let extra = crate::config::mcp_args_for(&binary, &id, info.port, &info.token, &cfg_path);
+    full.extend(extra);
+
+    let (handle, proxy_child) = Proxy::spawn(&full, &cwd)?;
+
+    // Long-poll thread gets a clone of the handle (no shared ownership of child).
+    let stop = Arc::new(AtomicBool::new(false));
+    let poll_handle = {
+        let info = info.clone();
+        let id = id.clone();
+        let poll_handle_clone = handle.clone();
+        let stop = Arc::clone(&stop);
+        std::thread::spawn(move || poll_loop(&info, &id, &poll_handle_clone, &stop))
+    };
+
+    // Main thread owns the child; blocks here until agent exits.
+    let code = proxy_child.wait();
+
+    stop.store(true, Ordering::SeqCst);
+    let _ = poll_handle.join();
+    let _ = deregister(&info, &id);
+    std::process::exit(code);
+}
+
+fn register(info: &BrokerInfo, binary: &str, as_id: Option<&str>) -> Result<String> {
+    let url = format!("http://127.0.0.1:{}/register?token={}", info.port, info.token);
+    let body = serde_json::json!({ "binary": binary, "as": as_id });
+    let resp: serde_json::Value =
+        reqwest::blocking::Client::new().post(&url).json(&body).send()?.json()?;
+    if let Some(err) = resp.get("error").and_then(|v| v.as_str()) {
+        if err == "collision" {
+            anyhow::bail!("id '{}' already in use", as_id.unwrap_or(binary));
+        }
+        anyhow::bail!("register failed: {resp}");
+    }
+    if let Some(id) = resp.get("id").and_then(|v| v.as_str()) {
+        return Ok(id.to_string());
+    }
+    anyhow::bail!("register failed (no id): {resp}")
+}
+
+fn deregister(info: &BrokerInfo, id: &str) -> Result<()> {
+    let url = format!("http://127.0.0.1:{}/deregister?token={}", info.port, info.token);
+    reqwest::blocking::Client::new()
+        .post(&url)
+        .json(&serde_json::json!({ "id": id }))
+        .send()?;
+    Ok(())
+}
+
+fn poll_loop(info: &BrokerInfo, id: &str, handle: &ProxyHandle, stop: &AtomicBool) {
+    let url = format!("http://127.0.0.1:{}/poll/{id}?token={}", info.port, info.token);
+    let client = reqwest::blocking::Client::builder()
+        .timeout(Duration::from_secs(30))
+        .build()
+        .unwrap();
+    while !stop.load(Ordering::SeqCst) {
+        match client.get(&url).send().and_then(|r| r.json::<serde_json::Value>()) {
+            Ok(v) => {
+                if let Some(msg) = v.get("message").filter(|m| !m.is_null()) {
+                    let from = msg.get("from").and_then(|s| s.as_str()).unwrap_or("peer");
+                    let text = msg.get("text").and_then(|s| s.as_str()).unwrap_or("");
+                    handle.inject(&format!("[message from {from}]: {text}"));
+                }
+            }
+            Err(_) => std::thread::sleep(Duration::from_millis(500)),
+        }
+    }
+}

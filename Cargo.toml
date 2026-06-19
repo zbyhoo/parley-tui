@@ -15,6 +15,10 @@ path = "src/bin/spike.rs"
 name = "hub_spike"
 path = "src/bin/hub_spike.rs"
 
+[[bin]]
+name = "proxy_spike"
+path = "src/bin/proxy_spike.rs"
+
 [dependencies]
 anyhow = "1.0.102"
 axum = "0.8.9"

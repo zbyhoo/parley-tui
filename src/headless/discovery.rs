@@ -51,6 +51,107 @@ pub fn random_token() -> String {
     format!("{n:032x}").chars().take(32).collect()
 }
 
+use std::time::{Duration, Instant};
+
+fn health_ok(info: &BrokerInfo, cwd: &Path) -> bool {
+    let want = std::fs::canonicalize(cwd)
+        .map(|p| p.to_string_lossy().into_owned())
+        .unwrap_or_else(|_| cwd.to_string_lossy().into_owned());
+    let url = format!("http://127.0.0.1:{}/health?token={}", info.port, info.token);
+    match reqwest::blocking::Client::new()
+        .get(&url)
+        .timeout(Duration::from_millis(500))
+        .send()
+        .and_then(|r| r.json::<serde_json::Value>())
+    {
+        Ok(v) => v.get("cwd").and_then(|c| c.as_str()) == Some(want.as_str()),
+        Err(_) => false,
+    }
+}
+
+fn spawn_daemon(self_exe: &Path, cwd: &Path, state_dir: &Path) -> std::io::Result<()> {
+    use std::process::Command;
+    std::fs::create_dir_all(state_dir)?;
+    let log = std::fs::OpenOptions::new()
+        .create(true)
+        .append(true)
+        .open(state_dir.join("broker.log"))?;
+    let log_err = log.try_clone()?;
+    let mut cmd = Command::new(self_exe);
+    cmd.arg("__serve")
+        .current_dir(cwd)
+        .stdin(std::process::Stdio::null())
+        .stdout(std::process::Stdio::from(log))
+        .stderr(std::process::Stdio::from(log_err));
+    #[cfg(unix)]
+    {
+        use std::os::unix::process::CommandExt;
+        cmd.process_group(0);
+    }
+    cmd.spawn()?;
+    Ok(())
+}
+
+pub fn ensure_broker(
+    state_dir: &Path,
+    cwd: &Path,
+    self_exe: &Path,
+) -> anyhow::Result<BrokerInfo> {
+    let bj = broker_json_path(state_dir);
+    if let Some(info) = read(&bj) {
+        if health_ok(&info, cwd) {
+            return Ok(info);
+        }
+    }
+    // Atomically take lockfile; stale > 10 s locks are removed and retried.
+    let lock = lock_path(state_dir);
+    std::fs::create_dir_all(state_dir)?;
+    loop {
+        match std::fs::OpenOptions::new()
+            .write(true)
+            .create_new(true)
+            .open(&lock)
+        {
+            Ok(_) => break,
+            Err(_) => {
+                // Another wrapper may already be starting — poll broker.json.
+                if let Some(info) = read(&bj) {
+                    if health_ok(&info, cwd) {
+                        return Ok(info);
+                    }
+                }
+                let stale = std::fs::metadata(&lock)
+                    .and_then(|m| m.modified())
+                    .map(|t| t.elapsed().map(|e| e > Duration::from_secs(10)).unwrap_or(true))
+                    .unwrap_or(true);
+                if stale {
+                    let _ = std::fs::remove_file(&lock);
+                }
+                std::thread::sleep(Duration::from_millis(100));
+            }
+        }
+    }
+    let _guard = LockGuard(lock.clone());
+    spawn_daemon(self_exe, cwd, state_dir)?;
+    let deadline = Instant::now() + Duration::from_secs(5);
+    while Instant::now() < deadline {
+        if let Some(info) = read(&bj) {
+            if health_ok(&info, cwd) {
+                return Ok(info);
+            }
+        }
+        std::thread::sleep(Duration::from_millis(100));
+    }
+    anyhow::bail!("broker did not come up within 5s (see .parley/broker.log)")
+}
+
+struct LockGuard(PathBuf);
+impl Drop for LockGuard {
+    fn drop(&mut self) {
+        let _ = std::fs::remove_file(&self.0);
+    }
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;

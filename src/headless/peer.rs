@@ -3,7 +3,7 @@
 use std::collections::HashMap;
 use tokio::sync::mpsc;
 
-#[derive(Debug, Clone, PartialEq, Eq)]
+#[derive(Debug, Clone, PartialEq, Eq, serde::Serialize, serde::Deserialize)]
 pub struct IncomingMsg {
     pub from: String,
     pub text: String,

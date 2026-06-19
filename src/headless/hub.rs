@@ -1,6 +1,6 @@
 //! Broker-demon headless: stan, rmcp handler, serwer axum.
 
-use std::collections::HashSet;
+use std::collections::{HashMap, HashSet};
 use std::sync::{Arc, Mutex};
 
 use rmcp::handler::server::router::tool::ToolRouter;
@@ -19,6 +19,7 @@ pub struct HubState {
     pub cwd: String,
     pub timeline: Mutex<Timeline>,
     pub pollers: Mutex<HashSet<String>>,
+    pub receivers: Mutex<HashMap<String, Arc<tokio::sync::Mutex<tokio::sync::mpsc::Receiver<crate::headless::peer::IncomingMsg>>>>>,
 }
 
 /// Buduje tekst zwracany agentowi po `send_to_peer`.
@@ -163,6 +164,177 @@ impl ServerHandler for HubBroker {
         );
         info
     }
+}
+
+// ─── axum control endpoints + serve() ────────────────────────────────────────
+
+use std::path::PathBuf;
+use std::time::Duration;
+
+use axum::extract::{Path as AxPath, Query, State};
+use axum::routing::{get, post};
+use axum::Json;
+use rmcp::transport::streamable_http_server::session::local::LocalSessionManager;
+use rmcp::transport::streamable_http_server::tower::{
+    StreamableHttpServerConfig, StreamableHttpService,
+};
+use serde::Serialize;
+use std::net::TcpListener as StdTcpListener;
+
+#[derive(serde::Deserialize)]
+struct TokenQ {
+    token: String,
+}
+
+#[derive(serde::Deserialize)]
+struct RegisterReq {
+    binary: String,
+    #[serde(default)]
+    r#as: Option<String>,
+}
+
+#[derive(Serialize)]
+#[allow(dead_code)]
+struct RegisterResp {
+    id: String,
+}
+
+#[derive(serde::Deserialize)]
+struct DeregisterReq {
+    id: String,
+}
+
+#[derive(Serialize)]
+struct PollResp {
+    message: Option<crate::headless::peer::IncomingMsg>,
+}
+
+fn ok_token(state: &HubState, t: &str) -> bool {
+    t == state.token
+}
+
+async fn health(
+    State(state): State<Arc<HubState>>,
+    Query(q): Query<TokenQ>,
+) -> Json<serde_json::Value> {
+    if !ok_token(&state, &q.token) {
+        return Json(serde_json::json!({ "error": "invalid token" }));
+    }
+    Json(serde_json::json!({ "cwd": state.cwd }))
+}
+
+async fn register(
+    State(state): State<Arc<HubState>>,
+    Query(q): Query<TokenQ>,
+    Json(req): Json<RegisterReq>,
+) -> Json<serde_json::Value> {
+    if !ok_token(&state, &q.token) {
+        return Json(serde_json::json!({ "error": "invalid token" }));
+    }
+    let mut reg = state.reg.lock().unwrap();
+    match reg.register(&req.binary, req.r#as.as_deref()) {
+        Ok((id, rx)) => {
+            state
+                .receivers
+                .lock()
+                .unwrap()
+                .insert(id.clone(), Arc::new(tokio::sync::Mutex::new(rx)));
+            Json(serde_json::json!({ "id": id }))
+        }
+        Err(RegisterError::Collision(c)) => {
+            Json(serde_json::json!({ "error": "collision", "id": c }))
+        }
+    }
+}
+
+async fn poll(
+    State(state): State<Arc<HubState>>,
+    AxPath(id): AxPath<String>,
+    Query(q): Query<TokenQ>,
+) -> Json<PollResp> {
+    if !ok_token(&state, &q.token) {
+        return Json(PollResp { message: None });
+    }
+    let rx = state.receivers.lock().unwrap().get(&id).cloned();
+    let Some(rx) = rx else {
+        return Json(PollResp { message: None });
+    };
+    state.pollers.lock().unwrap().insert(id.clone());
+    let mut guard = rx.lock().await;
+    let msg = match tokio::time::timeout(Duration::from_secs(25), guard.recv()).await {
+        Ok(Some(m)) => Some(m),
+        _ => None,
+    };
+    state.pollers.lock().unwrap().remove(&id);
+    Json(PollResp { message: msg })
+}
+
+async fn deregister(
+    State(state): State<Arc<HubState>>,
+    Query(q): Query<TokenQ>,
+    Json(req): Json<DeregisterReq>,
+) -> Json<serde_json::Value> {
+    if ok_token(&state, &q.token) {
+        state.reg.lock().unwrap().deregister(&req.id);
+        state.receivers.lock().unwrap().remove(&req.id);
+        state.pollers.lock().unwrap().remove(&req.id);
+    }
+    Json(serde_json::json!({ "ok": true }))
+}
+
+/// Bind 127.0.0.1:0, build HubState (token, session timeline), write broker.json, serve forever.
+/// Foreground; called by `parley __serve`.
+pub fn serve(cwd: PathBuf) -> anyhow::Result<()> {
+    use crate::headless::discovery::{broker_json_path, random_token, write_atomic, BrokerInfo};
+
+    let std_listener = StdTcpListener::bind("127.0.0.1:0")?;
+    std_listener.set_nonblocking(true)?;
+    let port = std_listener.local_addr()?.port();
+    let token = random_token();
+
+    let cfg = crate::config::Config::load(&cwd)?;
+    let state_dir = cfg.state_dir.clone().unwrap_or_else(|| cwd.join(".parley"));
+    let session = format!("session-{}", chrono::Local::now().format("%Y%m%d-%H%M%S"));
+    let timeline = Timeline::open(&state_dir.join(&session).join("timeline.jsonl"))?;
+
+    let state = Arc::new(HubState {
+        reg: Mutex::new(Registry::new()),
+        token: token.clone(),
+        cwd: cwd.to_string_lossy().into_owned(),
+        timeline: Mutex::new(timeline),
+        pollers: Mutex::new(HashSet::new()),
+        receivers: Mutex::new(HashMap::new()),
+    });
+
+    write_atomic(
+        &broker_json_path(&state_dir),
+        &BrokerInfo {
+            port,
+            pid: std::process::id(),
+            token,
+            cwd: state.cwd.clone(),
+        },
+    )?;
+
+    let rt = tokio::runtime::Builder::new_current_thread().enable_all().build()?;
+    rt.block_on(async move {
+        let listener = tokio::net::TcpListener::from_std(std_listener)?;
+        let mcp_state = state.clone();
+        let mcp = StreamableHttpService::new(
+            move || Ok(HubBroker::new(mcp_state.clone())),
+            Arc::new(LocalSessionManager::default()),
+            StreamableHttpServerConfig::default(),
+        );
+        let app = axum::Router::new()
+            .nest_service("/mcp", mcp)
+            .route("/health", get(health))
+            .route("/register", post(register))
+            .route("/poll/{id}", get(poll))
+            .route("/deregister", post(deregister))
+            .with_state(state.clone());
+        axum::serve(listener, app).await?;
+        Ok::<(), anyhow::Error>(())
+    })
 }
 
 #[cfg(test)]

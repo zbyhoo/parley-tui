@@ -1539,6 +1539,7 @@ dependencies = [
  "axum",
  "chrono",
  "http",
+ "libc",
  "portable-pty",
  "ratatui",
  "reqwest",

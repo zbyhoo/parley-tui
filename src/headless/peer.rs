@@ -1,12 +1,27 @@
-//! Rejestr live peerów headless: tożsamość, indeksy, kanały dostarczania, routing.
+//! Rejestr live peerów headless: tożsamość, indeksy, kanały dostarczania, routing,
+//! liveness (touch/reap) i recykling id.
 
 use std::collections::HashMap;
+use std::time::{Duration, Instant};
+
+use serde::{Deserialize, Serialize};
 use tokio::sync::mpsc;
 
-#[derive(Debug, Clone, PartialEq, Eq, serde::Serialize, serde::Deserialize)]
+/// Rodzaj wiadomości wstrzykiwanej do agenta przez wrapper.
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+#[serde(rename_all = "snake_case")]
+pub enum MsgKind {
+    /// Wiadomość od innego peera — wrapper dokleja instrukcję odpowiedzi.
+    Peer,
+    /// Komunikat systemowy parley (np. anons dołączenia) — wstrzykiwany dosłownie.
+    System,
+}
+
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
 pub struct IncomingMsg {
     pub from: String,
     pub text: String,
+    pub kind: MsgKind,
 }
 
 #[derive(Debug, PartialEq, Eq)]
@@ -25,26 +40,31 @@ pub enum SendOutcome {
 struct Peer {
     binary: String,
     sender: Option<mpsc::Sender<IncomingMsg>>,
+    last_seen: Instant,
 }
 
 pub struct Registry {
     peers: HashMap<String, Peer>,
-    next_idx: HashMap<String, u32>,
 }
 
 impl Registry {
     pub fn new() -> Self {
-        Registry { peers: HashMap::new(), next_idx: HashMap::new() }
+        Registry { peers: HashMap::new() }
     }
 
-    fn alloc_id(&mut self, binary: &str) -> String {
-        let n = self.next_idx.entry(binary.to_string()).or_insert(1);
+    /// Najniższe wolne id dla danej binarki: `binary`, potem `binary-2`, `binary-3`…
+    /// Recykluje zwolnione nazwy (w przeciwieństwie do monotonicznego licznika).
+    fn alloc_id(&self, binary: &str) -> String {
+        if !self.peers.contains_key(binary) {
+            return binary.to_string();
+        }
+        let mut n = 2;
         loop {
-            let id = if *n == 1 { binary.to_string() } else { format!("{binary}-{n}") };
-            *n += 1;
-            if !self.peers.contains_key(&id) {
-                return id;
+            let cand = format!("{binary}-{n}");
+            if !self.peers.contains_key(&cand) {
+                return cand;
             }
+            n += 1;
         }
     }
 
@@ -63,7 +83,10 @@ impl Registry {
             None => self.alloc_id(binary),
         };
         let (tx, rx) = mpsc::channel(256);
-        self.peers.insert(id.clone(), Peer { binary: binary.to_string(), sender: Some(tx) });
+        self.peers.insert(
+            id.clone(),
+            Peer { binary: binary.to_string(), sender: Some(tx), last_seen: Instant::now() },
+        );
         Ok((id, rx))
     }
 
@@ -71,8 +94,10 @@ impl Registry {
         if self.peers.contains_key(id) {
             return Err(RegisterError::Collision(id.to_string()));
         }
-        // binarka = id (najlepsze przybliżenie dla gołego CLI)
-        self.peers.insert(id.to_string(), Peer { binary: id.to_string(), sender: None });
+        self.peers.insert(
+            id.to_string(),
+            Peer { binary: id.to_string(), sender: None, last_seen: Instant::now() },
+        );
         Ok(())
     }
 
@@ -84,11 +109,48 @@ impl Registry {
         self.peers.contains_key(id)
     }
 
+    /// Odświeża znacznik życia peera (wołane przy każdym /poll).
+    pub fn touch(&mut self, id: &str, now: Instant) {
+        if let Some(p) = self.peers.get_mut(id) {
+            p.last_seen = now;
+        }
+    }
+
+    /// Usuwa peerów, których ostatni kontakt jest starszy niż `ttl`. Zwraca usunięte id.
+    pub fn reap(&mut self, now: Instant, ttl: Duration) -> Vec<String> {
+        let dead: Vec<String> = self
+            .peers
+            .iter()
+            .filter(|(_, p)| now.duration_since(p.last_seen) > ttl)
+            .map(|(id, _)| id.clone())
+            .collect();
+        for id in &dead {
+            self.peers.remove(id);
+        }
+        dead
+    }
+
     pub fn list(&self) -> Vec<(String, String)> {
         let mut v: Vec<(String, String)> =
             self.peers.iter().map(|(id, p)| (id.clone(), p.binary.clone())).collect();
         v.sort();
         v
+    }
+
+    /// Wysyła komunikat systemowy do wszystkich żywych peerów poza `except`.
+    pub fn send_system_to_all(&self, text: &str, except: &str) {
+        for (id, p) in &self.peers {
+            if id == except {
+                continue;
+            }
+            if let Some(tx) = &p.sender {
+                let _ = tx.try_send(IncomingMsg {
+                    from: "parley".to_string(),
+                    text: text.to_string(),
+                    kind: MsgKind::System,
+                });
+            }
+        }
     }
 
     pub fn route(&mut self, from: &str, to: &str, text: &str) -> Vec<SendOutcome> {
@@ -104,19 +166,21 @@ impl Registry {
         for t in targets {
             match self.peers.get(&t).and_then(|p| p.sender.clone()) {
                 Some(tx) => {
-                    let msg = IncomingMsg { from: from.to_string(), text: text.to_string() };
+                    let msg = IncomingMsg {
+                        from: from.to_string(),
+                        text: text.to_string(),
+                        kind: MsgKind::Peer,
+                    };
                     match tx.try_send(msg) {
                         Ok(()) => out.push(SendOutcome::Delivered(t)),
-                        Err(_) => out.push(SendOutcome::Queued(t)), // kanał pełny / bez odbiorcy
+                        Err(_) => out.push(SendOutcome::Queued(t)),
                     }
                 }
                 None if self.peers.contains_key(&t) => {
-                    // peer MCP-only (bez kanału) — nie da się dostarczyć push
                     out.push(SendOutcome::Queued(t));
                 }
                 None => {
-                    let present = self.peers.keys().cloned().collect::<Vec<_>>();
-                    let mut present = present;
+                    let mut present = self.peers.keys().cloned().collect::<Vec<_>>();
                     present.sort();
                     out.push(SendOutcome::NoSuchPeer { to: t, present });
                 }
@@ -137,23 +201,35 @@ mod tests {
     use super::*;
 
     #[test]
-    fn auto_ids_are_monotonic_no_reuse() {
+    fn auto_ids_recycle_lowest_free() {
         let mut r = Registry::new();
         let (id1, _rx1) = r.register("claude", None).unwrap();
         let (id2, _rx2) = r.register("claude", None).unwrap();
         assert_eq!(id1, "claude");
         assert_eq!(id2, "claude-2");
-        r.deregister("claude"); // zwolnij pierwszego
+        r.deregister("claude"); // zwolnij najniższy
         let (id3, _rx3) = r.register("claude", None).unwrap();
-        assert_eq!(id3, "claude-3", "indeks nie jest recyklowany");
+        assert_eq!(id3, "claude", "wolne id jest recyklowane");
+    }
+
+    #[test]
+    fn auto_id_skips_live_taken_name() {
+        let mut r = Registry::new();
+        let (_id, _rx) = r.register("x", Some("codex")).unwrap(); // żywy peer "codex"
+        let (auto, _rx2) = r.register("codex", None).unwrap();
+        assert_ne!(auto, "codex", "auto-id nie nadpisuje żywego peera");
+        assert_eq!(auto, "codex-2");
+        assert!(r.is_live("codex"));
     }
 
     #[test]
     fn as_override_collision_is_error() {
         let mut r = Registry::new();
         let (_id, _rx) = r.register("claude", Some("reviewer")).unwrap();
-        let result = r.register("codex", Some("reviewer"));
-        assert!(matches!(result, Err(RegisterError::Collision(ref s)) if s == "reviewer"));
+        assert!(matches!(
+            r.register("codex", Some("reviewer")),
+            Err(RegisterError::Collision(ref s)) if s == "reviewer"
+        ));
     }
 
     #[test]
@@ -174,14 +250,17 @@ mod tests {
     }
 
     #[tokio::test]
-    async fn route_delivers_to_channel() {
+    async fn route_delivers_peer_kind_to_channel() {
         let mut r = Registry::new();
         let (claude, _rxc) = r.register("claude", None).unwrap();
         let (_codex, mut rxx) = r.register("codex", None).unwrap();
         let out = r.route(&claude, "codex", "ping");
         assert_eq!(out, vec![SendOutcome::Delivered("codex".into())]);
         let msg = rxx.recv().await.unwrap();
-        assert_eq!(msg, IncomingMsg { from: "claude".into(), text: "ping".into() });
+        assert_eq!(
+            msg,
+            IncomingMsg { from: "claude".into(), text: "ping".into(), kind: MsgKind::Peer }
+        );
     }
 
     #[tokio::test]
@@ -190,8 +269,7 @@ mod tests {
         let (claude, _rxc) = r.register("claude", None).unwrap();
         let (_codex, mut rxx) = r.register("codex", None).unwrap();
         let (_gem, mut rxg) = r.register("gemini", None).unwrap();
-        let mut out = r.route(&claude, "all", "hello");
-        out.sort_by_key(|o| format!("{o:?}"));
+        let out = r.route(&claude, "all", "hello");
         assert_eq!(out.len(), 2);
         assert_eq!(rxx.recv().await.unwrap().text, "hello");
         assert_eq!(rxg.recv().await.unwrap().text, "hello");
@@ -202,8 +280,8 @@ mod tests {
         let mut r = Registry::new();
         r.register_mcp_only("claude").unwrap();
         assert!(r.is_live("claude"));
-        let out = r.route("claude", "all", "x"); // brak innych peerów
-        assert_eq!(out, vec![]); // nikogo do dostarczenia, ale from był live → nie NotRegistered
+        let out = r.route("claude", "all", "x");
+        assert_eq!(out, vec![]);
     }
 
     #[test]
@@ -214,11 +292,45 @@ mod tests {
     }
 
     #[test]
-    fn auto_id_skips_manually_taken_name() {
+    fn reap_removes_stale_keeps_touched() {
         let mut r = Registry::new();
-        let (_id, _rx) = r.register("x", Some("codex")).unwrap(); // manual peer named "codex"
-        let (auto, _rx2) = r.register("codex", None).unwrap();      // auto for binary "codex"
-        assert_ne!(auto, "codex", "auto id must not overwrite the live manual peer");
-        assert!(r.is_live("codex"));
+        let (a, _rxa) = r.register("claude", None).unwrap();
+        let (_b, _rxb) = r.register("codex", None).unwrap();
+        let t0 = Instant::now();
+        let ttl = Duration::from_secs(60);
+        // odśwież claude "w przyszłości", codex zostaw nieświeży
+        r.touch(&a, t0 + Duration::from_secs(100));
+        let reaped = r.reap(t0 + Duration::from_secs(120), ttl);
+        // codex: last_seen≈t0, 120s > 60s → reaped; claude: last_seen=t0+100, 20s < 60s → żyje
+        assert_eq!(reaped, vec!["codex".to_string()]);
+        assert!(r.is_live("claude"));
+        assert!(!r.is_live("codex"));
+    }
+
+    #[test]
+    fn reap_after_empty_allows_id_reset() {
+        let mut r = Registry::new();
+        let (_a, _rxa) = r.register("claude", None).unwrap();
+        let t0 = Instant::now();
+        let reaped = r.reap(t0 + Duration::from_secs(120), Duration::from_secs(60));
+        assert_eq!(reaped, vec!["claude".to_string()]);
+        // registry puste → następny claude znów "claude"
+        let (id, _rx) = r.register("claude", None).unwrap();
+        assert_eq!(id, "claude");
+    }
+
+    #[tokio::test]
+    async fn system_broadcast_reaches_others_not_sender() {
+        let mut r = Registry::new();
+        let (_a, mut rxa) = r.register("claude", None).unwrap();
+        let (b, mut rxb) = r.register("codex", None).unwrap();
+        r.send_system_to_all("hello-system", &b); // except = codex (the joiner)
+        // claude (nie-except) dostaje System
+        let msg = rxa.recv().await.unwrap();
+        assert_eq!(msg.kind, MsgKind::System);
+        assert_eq!(msg.from, "parley");
+        assert_eq!(msg.text, "hello-system");
+        // codex (except) nic nie dostaje
+        assert!(rxb.try_recv().is_err());
     }
 }

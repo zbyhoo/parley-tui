@@ -35,7 +35,7 @@ pub fn run(as_id: Option<String>, command: Vec<String>) -> Result<()> {
     if !peers.is_empty() {
         let list = peers.join(", ");
         handle.inject(&format!(
-            "[parley: connected peers: {list} — reach them with send_to_peer(to=\"<id>\")]"
+            "[parley: connected peers: {list} — to reach one, call send_to_peer with its id as \"to\"]"
         ));
     }
 

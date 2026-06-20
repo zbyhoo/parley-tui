@@ -209,15 +209,19 @@ pub fn write_mcp_config_json(
 
 /// Treść configu opencode (do zmiennej `OPENCODE_CONFIG_CONTENT`).
 /// Opencode nie ma flagi `--mcp-config`; serwer MCP konfiguruje się plikiem/env.
-/// Wstrzykujemy inline JSON per-proces: remote MCP brokera + nagłówki (id + token),
-/// oraz `permission: {"*":"allow"}` żeby agent nie pytał o zgodę na każde wywołanie narzędzia.
+/// Wstrzykujemy inline JSON per-proces: remote MCP brokera + nagłówki (id + token).
+/// Uprawnienia zawężone (jak claude/codex): auto-approve TYLKO narzędzi parley
+/// (`parley_*`), a mutujące/egress (`edit`→write/edit/apply_patch, `bash`, `webfetch`)
+/// idą przez bramkę zatwierdzenia w TUI. Reszta zostaje na permisywnym defaulcie
+/// opencode (read/grep/glob/list). Nie dajemy globalnego `"*":"allow"` — peer może
+/// wstrzyknąć prompt, więc destrukcyjne operacje muszą mieć bramkę człowieka.
 pub fn opencode_config_content(id: &str, port: u16, token: &str) -> String {
     format!(
         "{{\"$schema\":\"https://opencode.ai/config.json\",\
          \"mcp\":{{\"parley\":{{\"type\":\"remote\",\
          \"url\":\"http://127.0.0.1:{port}/mcp\",\"enabled\":true,\
          \"headers\":{{\"X-Agent-Id\":\"{id}\",\"X-Parley-Token\":\"{token}\"}}}}}},\
-         \"permission\":{{\"*\":\"allow\"}}}}"
+         \"permission\":{{\"parley_*\":\"allow\",\"edit\":\"ask\",\"bash\":\"ask\",\"webfetch\":\"ask\"}}}}"
     )
 }
 
@@ -426,10 +430,16 @@ resume_command = ["codex", "resume", "--last"]
         assert!(c.contains("http://127.0.0.1:8765/mcp"));
         assert!(c.contains("\"X-Agent-Id\":\"opencode-2\""));
         assert!(c.contains("\"X-Parley-Token\":\"tok123\""));
-        assert!(c.contains("\"permission\":{\"*\":\"allow\"}"));
         // Musi być poprawnym JSON-em (trafia do OPENCODE_CONFIG_CONTENT).
         let v: serde_json::Value = serde_json::from_str(&c).expect("valid JSON");
         assert_eq!(v["mcp"]["parley"]["url"], "http://127.0.0.1:8765/mcp");
+        // Auto-approve zawężone do narzędzi parley; mutujące/egress przez bramkę.
+        assert_eq!(v["permission"]["parley_*"], "allow");
+        assert_eq!(v["permission"]["edit"], "ask");
+        assert_eq!(v["permission"]["bash"], "ask");
+        assert_eq!(v["permission"]["webfetch"], "ask");
+        // Bez globalnego "*":"allow" (regresja bezpieczeństwa — peer prompt injection).
+        assert!(v["permission"].get("*").is_none());
     }
 
     #[test]
